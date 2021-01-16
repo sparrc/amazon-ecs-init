@@ -1,0 +1,159 @@
+#!/bin/bash
+
+action="${1}"
+
+pre-start-gpu() {
+    if [ "$ECS_ENABLE_GPU_SUPPORT" != "true" ]; then
+        return
+    fi
+    echo "By using the GPU Optimized AMI, you agree to Nvidia’s End User License Agreement: https://www.nvidia.com/en-us/about-nvidia/eula-agreement/"
+
+    # detect gpu devices
+    if ! ls /dev/nvidia* >/dev/null; then
+        echo "GPU support enabled but no GPU devices detected"
+        return
+    fi
+    # check nvidia driver is OK
+    if ! nvidia-smi; then
+        echo "Problem with nvidia driver, error running nvidia-smi"
+        return
+    fi
+    DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | tail -n1)
+    echo "Nvidia driver version: $DRIVER_VERSION"
+    gpulist="["
+    for gpuid in $(nvidia-smi --query-gpu=uuid --format=csv,noheader); do
+        gpulist+="\"$gpuid\","
+    done
+    gpulist=${gpulist:0:-1} # trim last comma
+    gpulist+="]"
+    echo "GPU UUIDs: $gpulist"
+    mkdir -p /var/lib/ecs/gpu
+    echo "{\"DriverVersion\":\"${DRIVER_VERSION}\",\"GPUIDs\":$gpulist}" >/var/lib/ecs/gpu/nvidia-gpu-info.json
+    chmod 700 /var/lib/ecs/gpu/nvidia-gpu-info.json
+}
+
+pre-start() {
+    # enables routing to loopback addresses
+    sysctl -e -w "net.ipv4.conf.all.route_localnet=1"
+    # disables ipv6 router advertisements
+    sysctl -e -w "net.ipv6.conf.docker0.accept_ra=0"
+    iptables -t nat -A PREROUTING -p tcp -d 169.254.170.2 --dport 80 -j DNAT --to-destination 127.0.0.1:51679
+    iptables -t nat -A OUTPUT -d 169.254.170.2 -p tcp -m tcp --dport 80 -j REDIRECT --to-ports 51679
+    # TODO introspection endpoint configuration options
+    iptables -A INPUT -i eth0 -p tcp --dport 51678 -j DROP
+    iptables-save >/etc/sysconfig/iptables
+    pre-start-gpu
+    if [ -z "$(docker images --quiet amazon/amazon-ecs-agent:latest)" ]; then
+        if [ -f "/var/cache/ecs/ecs-agent.tar" ]; then
+            docker load --input "/var/cache/ecs/ecs-agent.tar"
+        else
+            echo "/var/cache/ecs/ecs-agent.tar not found"
+            # TODO download latest agent tarball for current region
+        fi
+    fi
+    /usr/bin/docker stop ecs-agent 2>/dev/null || true
+    /usr/bin/docker rm ecs-agent 2>/dev/null || true
+}
+
+start() {
+    # TODOs:
+    #   * logconfig
+    #   * allow these default env vars to be overridden by /etc/ecs/ecs.config
+    #   * platform-specific SSL_CERT_DIR
+    #   * ECS_AGENT_LABELS (undocumented, is this necessary?)
+    ADDITIONALARGS=""
+    if [ "$ECS_AGENT_RUN_PRIVILEGED" == "true" ]; then
+        ADDITIONALARGS+="--privileged "
+    fi
+    if [ "$ECS_ENABLE_GPU_SUPPORT" == "true" ]; then
+        ADDITIONALARGS+="--volume /var/lib/ecs/gpu:/var/lib/ecs/gpu "
+    fi
+    /usr/bin/docker run --rm --name ecs-agent $ADDITIONALARGS \
+        --init \
+        --volume=/var/run:/var/run \
+        --volume=/var/log/ecs/:/log \
+        --volume=/var/lib/ecs/data:/data \
+        --volume=/etc/ecs:/etc/ecs \
+        --volume=/root/.aws:/rotatingcreds:ro \
+        --volume=/sys/fs/cgroup:/sys/fs/cgroup \
+        --volume=/var/cache/ecs:/var/cache/ecs \
+        --net=host \
+        --cap-add=NET_ADMIN \
+        --cap-add=SYS_ADMIN \
+        --userns=host \
+        --env-file=/etc/ecs/ecs.config \
+        --env ECS_UPDATES_ENABLED=true \
+        --env ECS_ENABLE_TASK_IAM_ROLE=true \
+        --env ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=true \
+        --env ECS_AVAILABLE_LOGGING_DRIVERS='["json-file","syslog","awslogs","fluentd","none"]' \
+        --env ECS_DATADIR=/data \
+        --env ECS_LOGFILE=/log/ecs-agent.log \
+        --env ECS_AGENT_CONFIG_FILE_PATH=/ecs.config.json \
+        --env ECS_UPDATE_DOWNLOAD_DIR=/var/cache/ecs \
+        --env ECS_VOLUME_PLUGIN_CAPABILITIES='["efsAuth"]' \
+        --env SSL_CERT_DIR=/etc/pki/tls/certs \
+        --env ECS_ENABLE_AWSLOGS_EXECUTIONROLE_OVERRIDE=true \
+        --env ECS_ENABLE_TASK_ENI=true \
+        amazon/amazon-ecs-agent:latest
+    rc=$?
+    echo "ECS Agent container exited, code: $rc"
+    case $rc in
+    0)
+        echo "ECS Agent graceful exit code"
+        exit 0
+        ;;
+    2)
+        echo "ECS Agent container failed"
+        exit 2
+        ;;
+    5)
+        echo "ECS Agent terminal failure exit code"
+        exit -1
+        ;;
+    42)
+        echo "ECS Agent upgrade exit code"
+        DESIRED_AGENT_IMAGE="/var/cache/ecs/$(cat /var/cache/ecs/desired-image)"
+        if [ -f "$DESIRED_AGENT_IMAGE" ]; then
+            echo "Loading agent image from $DESIRED_AGENT_IMAGE"
+            docker rmi amazon/amazon-ecs-agent:latest
+            docker load --input "$DESIRED_AGENT_IMAGE"
+            start
+            exit 0
+        else
+            echo "Upgrade ERROR: file $DESIRED_AGENT_IMAGE does not exist"
+        fi
+        ;;
+    *)
+        echo "ECS Agent unknown exit code"
+        exit $rc
+        ;;
+    esac
+}
+
+stop() {
+    /usr/bin/docker stop ecs-agent 2>/dev/null || true
+}
+
+post-stop() {
+    echo "post-stop"
+    # TODO restore default loopback route setting
+}
+
+case $action in
+pre-start)
+    pre-start
+    ;;
+start)
+    start
+    ;;
+stop)
+    stop
+    ;;
+post-stop)
+    post-stop
+    ;;
+*)
+    echo "unknown action: $action"
+    exit 1
+    ;;
+esac
